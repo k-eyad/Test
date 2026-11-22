@@ -111,17 +111,29 @@ CIDR=$(ip -o -4 addr show dev "${IF:-lo}" 2>/dev/null | awk '{print $4; exit}')
 PREFIX=${CIDR#*/}; isnum "$PREFIX" || PREFIX=24
 MYMAC=$(cat "/sys/class/net/${IF:-lo}/address" 2>/dev/null)
 
+# All Wi-Fi adapters on this computer (a laptop may have a built-in card AND a USB dongle)
+WIFI_LIST=""
+have iw    && WIFI_LIST+=" $(iw dev 2>/dev/null | awk '/Interface/{print $2}')"
+have nmcli && WIFI_LIST+=" $(nmcli -t -f DEVICE,TYPE dev 2>/dev/null | awk -F: '$2=="wifi"{print $1}')"
+for d in /sys/class/net/*; do
+  if [ -e "$d/phy80211" ] || [ -d "$d/wireless" ]; then WIFI_LIST+=" $(basename "$d")"; fi
+done
+WIFI_LIST=$(tr ' ' '\n' <<<"$WIFI_LIST" | grep -v -e '^$' -e '^p2p-' | sort -u | tr '\n' ' ')
+wifi_connected() {
+  { have iw && iw dev "$1" link 2>/dev/null | grep -q '^Connected to'; } ||
+  { have nmcli && nmcli -t -f DEVICE,STATE dev 2>/dev/null | grep -q "^$1:connected"; }
+}
+# Choose: 1) the adapter carrying the internet route, 2) a connected adapter, 3) the first one
 WIFI_IF=""
-have iw && WIFI_IF=$(iw dev 2>/dev/null | awk '/Interface/{print $2}' | head -1)
-[ -z "$WIFI_IF" ] && have nmcli && WIFI_IF=$(nmcli -t -f DEVICE,TYPE dev 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}')
-if [ -z "$WIFI_IF" ]; then
-  for d in /sys/class/net/*/wireless; do [ -d "$d" ] && { WIFI_IF=$(basename "$(dirname "$d")"); break; }; done
-fi
+for w in $WIFI_LIST; do [ "$w" = "${IF:-}" ] && WIFI_IF=$w; done
+if [ -z "$WIFI_IF" ]; then for w in $WIFI_LIST; do wifi_connected "$w" && { WIFI_IF=$w; break; }; done; fi
+[ -z "$WIFI_IF" ] && WIFI_IF=$(awk '{print $1}' <<<"$WIFI_LIST")
 
 echo "Internet goes out via : ${IF:-NONE}"
 echo "Router (gateway)      : ${GW:-NONE}"
 echo "This computer         : ${MYIP:-?}/${PREFIX}   MAC ${MYMAC:-?}"
-echo "Wi-Fi interface       : ${WIFI_IF:-none found}"
+echo "Wi-Fi adapters found  : ${WIFI_LIST:-none}"
+echo "Wi-Fi adapter analysed: ${WIFI_IF:-none found}"
 [ -z "$GW" ] && echo "ERROR: no default gateway - the computer seems to be offline. Results will be limited."
 if [ -n "$WIFI_IF" ] && [ -n "$IF" ] && [ "$IF" != "$WIFI_IF" ]; then
   echo "NOTE: traffic currently uses $IF (not Wi-Fi). Wi-Fi sections describe the Wi-Fi link only."
@@ -191,17 +203,35 @@ elif have iw; then
   TXRETRY=$(awk '/tx retries:/{print $3; exit}' <<<"$STA")
   TXFAIL=$(awk '/tx failed:/{print $3; exit}'   <<<"$STA")
   BLOSS=$(awk '/beacon loss:/{print $3; exit}'  <<<"$STA")
-  sub "What this Wi-Fi adapter supports"
-  PHY=$(iw phy 2>/dev/null)
-  ADAPT_BANDS=$(awk '/^[[:space:]]*Band [0-9]+:/{b=$2; sub(":","",b); if(b==1)print "2.4GHz"; else if(b==2)print "5GHz"; else if(b==4)print "6GHz"}' <<<"$PHY" | sort -u | tr '\n' ' ')
-  if grep -q 'EHT' <<<"$PHY"; then ADAPT_GEN="Wi-Fi 7 (802.11be)"
-  elif grep -q 'HE Iftypes\|HE MAC Capabilities' <<<"$PHY"; then ADAPT_GEN="Wi-Fi 6/6E (802.11ax)"
-  elif grep -q 'VHT Capabilities' <<<"$PHY"; then ADAPT_GEN="Wi-Fi 5 (802.11ac)"
-  elif grep -q 'HT20/HT40\|HT Capabilities\|Capabilities: 0x' <<<"$PHY"; then ADAPT_GEN="Wi-Fi 4 (802.11n)"
-  else ADAPT_GEN="unknown"; fi
-  echo "Bands: ${ADAPT_BANDS:-unknown} | Standard: $ADAPT_GEN"
-  DRV=$(basename "$(readlink -f "/sys/class/net/$WIFI_IF/device/driver" 2>/dev/null)" 2>/dev/null)
-  echo "Driver: ${DRV:-unknown}"
+  sub "Wi-Fi adapters in this computer (each one checked separately)"
+  BEST_OTHER=""
+  for w in $WIFI_LIST; do
+    phy=$(iw dev "$w" info 2>/dev/null | awk '$1=="wiphy"{print "phy"$2; exit}')
+    P=$( [ -n "$phy" ] && iw phy "$phy" info 2>/dev/null )
+    # Fallback: with a single adapter, the combined 'iw phy' output belongs to it
+    [ -z "$P" ] && [ "$(wc -w <<<"$WIFI_LIST")" -eq 1 ] && P=$(iw phy 2>/dev/null)
+    bands=$(awk '/^[[:space:]]*Band [0-9]+:/{b=$2; sub(":","",b); if(b==1)print "2.4GHz"; else if(b==2)print "5GHz"; else if(b==4)print "6GHz"}' <<<"$P" | sort -u | tr '\n' ' ')
+    if   grep -q 'EHT' <<<"$P"; then gen="Wi-Fi 7"
+    elif grep -q 'HE Iftypes\|HE MAC Capabilities' <<<"$P"; then gen="Wi-Fi 6/6E"
+    elif grep -q 'VHT Capabilities' <<<"$P"; then gen="Wi-Fi 5"
+    elif grep -q 'HT20/HT40\|HT Capabilities' <<<"$P"; then gen="Wi-Fi 4"
+    else gen="unknown"; fi
+    drv=$(basename "$(readlink -f "/sys/class/net/$w/device/driver" 2>/dev/null)" 2>/dev/null)
+    model=$(udevadm info -q property -p "/sys/class/net/$w" 2>/dev/null | sed -n 's/^ID_MODEL_FROM_DATABASE=//p' | head -1)
+    bus=$(udevadm info -q property -p "/sys/class/net/$w" 2>/dev/null | sed -n 's/^ID_BUS=//p' | head -1)
+    state="not connected"; wifi_connected "$w" && state="CONNECTED"
+    printf '    %-14s %-11s %-16s %-10s driver=%-10s bus=%-4s %s\n' "$w" "$gen" "${bands:-?}" "$state" "${drv:-?}" "${bus:-?}" "${model:-}"
+    if [ "$w" = "$WIFI_IF" ]; then ADAPT_BANDS=$bands; ADAPT_GEN=$gen; DRV=$drv
+    elif grep -q '5GHz' <<<"$bands"; then BEST_OTHER="$w (${model:-$gen}, $bands)"; fi
+  done
+  if [ -n "${ADAPT_BANDS:-}" ] && ! grep -q '5GHz' <<<"$ADAPT_BANDS"; then
+    if [ -n "$BEST_OTHER" ]; then
+      finding 1 CONFIRMED PERF "This computer uses Wi-Fi adapter $WIFI_IF, which supports only 2.4 GHz, although adapter $BEST_OTHER can use 5 GHz. Connect through the better adapter."
+    else
+      finding 2 CONFIRMED PERF "This computer's Wi-Fi adapter ($WIFI_IF) supports only 2.4 GHz. It cannot use the faster 5 GHz band."
+    fi
+    echo "    NOTE: $WIFI_IF cannot see 5 GHz networks, so the 5 GHz part of the scan below will be empty."
+  fi
 else
   # Fallback without iw: NetworkManager + /proc/net/wireless
   ROW=$(nmcli -t -e no -f IN-USE,CHAN,FREQ,SIGNAL,SECURITY,BSSID,SSID dev wifi list ifname "$WIFI_IF" --rescan no 2>/dev/null | grep '^\*' | head -1)
@@ -587,9 +617,12 @@ else:
     url, st = wanconn[0]
     try:
         r = soap(url, st, 'GetStatusInfo')
-        print('    WAN status: %s, uptime %s s, last error: %s' % (r.get('NewConnectionStatus', '?'), r.get('NewUptime', '?'), r.get('NewLastConnectionError', '?')))
+        up = r.get('NewUptime', '')
+        ok = up.isdigit() and int(up) < 5 * 365 * 86400
+        print('    WAN status: %s, uptime %s s%s, last error: %s' % (r.get('NewConnectionStatus', '?'), up or '?',
+              '' if ok or not up else ' (implausible value reported by the router - ignore)', r.get('NewLastConnectionError', '?')))
         print('##WANSTATUS=%s' % r.get('NewConnectionStatus', ''))
-        print('##WANUPTIME=%s' % r.get('NewUptime', ''))
+        if ok: print('##WANUPTIME=%s' % up)
     except Exception as e:
         print('    WAN status: not available (%s)' % e.__class__.__name__)
     try:
@@ -884,10 +917,15 @@ for ip in $(awk '$1<=4{print $2}' <<<"$HOPS"); do
 done
 
 sub "MTU (largest packet size without fragmentation)"
-if have ping && ping -n -c1 -W2 1.1.1.1 >/dev/null 2>&1; then
-  mtu_ok() { ping -n -c1 -W2 -M do -s "$1" 1.1.1.1 >/dev/null 2>&1; }
+if have ping && ping -n -c 3 -i 0.3 -W 4 1.1.1.1 >/dev/null 2>&1; then
+  # A size counts as OK if ANY of 3 probes gets a reply within 4 s: on a slow,
+  # congested line a single late reply must not be mistaken for "too big".
+  mtu_ok() { ping -n -c 3 -i 0.3 -W 4 -M do -s "$1" 1.1.1.1 2>&1 | tee "$TMP/mtu_last" | grep -q ' bytes from '; }
   if mtu_ok 1472; then PMTU=1500
-  else lo=1172; hi=1472
+  else
+    HINT=$(grep -oE 'mtu ?= ?[0-9]+' "$TMP/mtu_last" | grep -oE '[0-9]+' | head -1)
+    lo=1172; hi=1472
+    if isnum "${HINT:-}" && [ "$HINT" -lt 1500 ] && [ "$HINT" -ge 1200 ] && mtu_ok $((HINT - 28)); then lo=$((HINT - 28)); hi=$((HINT - 27)); fi
     while [ $((hi - lo)) -gt 1 ]; do mid=$(((lo + hi) / 2)); if mtu_ok $mid; then lo=$mid; else hi=$mid; fi; done
     if mtu_ok $lo; then PMTU=$((lo + 28)); else PMTU="?"; fi
   fi
@@ -917,7 +955,8 @@ fi
 DL=""; UL=""
 if [ "$SPEEDTEST" -eq 1 ]; then
   sub "Speed test (Cloudflare) + latency under load (bufferbloat)"
-  echo "    Downloading 4x25 MB and uploading 4x10 MB..."
+  echo "    Downloading, then uploading, for at most 15 s each (4 parallel streams)."
+  echo "    On slow lines other devices will be slower for those ~30 s."
   stop_ping() { # SIGINT makes ping print its summary; SIGTERM is the fallback
     kill -INT "$1" 2>/dev/null
     for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$1" 2>/dev/null || break; sleep 0.2; done
@@ -931,9 +970,9 @@ if [ "$SPEEDTEST" -eq 1 ]; then
     t0=$(date +%s.%N)
     for k in 1 2 3 4; do
       if [ "$kind" = down ]; then
-        curl -s -m 60 -o /dev/null -w '%{size_download}\n' "https://speed.cloudflare.com/__down?bytes=25000000" >> "$TMP/bytes_$kind" &
+        curl -s -m 15 -o /dev/null -w '%{size_download}\n' "https://speed.cloudflare.com/__down?bytes=25000000" >> "$TMP/bytes_$kind" &
       else
-        curl -s -m 60 -o /dev/null -w '%{size_upload}\n' -H 'Content-Type: application/octet-stream' --data-binary @"$TMP/up.bin" "https://speed.cloudflare.com/__up" >> "$TMP/bytes_$kind" &
+        curl -s -m 15 -o /dev/null -w '%{size_upload}\n' -H 'Content-Type: application/octet-stream' --data-binary @"$TMP/up.bin" "https://speed.cloudflare.com/__up" >> "$TMP/bytes_$kind" &
       fi
       pids+=($!)
     done
